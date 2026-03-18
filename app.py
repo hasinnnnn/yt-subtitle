@@ -97,6 +97,58 @@ def format_seconds(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def parse_plain_text_to_items(text: str):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    items = []
+    for i, line in enumerate(lines):
+        items.append(
+            {
+                "text": line,
+                "start": i * 3,
+                "duration": 3,
+            }
+        )
+    return items
+
+
+def parse_srt(content: str):
+    blocks = re.split(r"\n\s*\n", content.strip(), flags=re.MULTILINE)
+    items = []
+
+    def srt_time_to_seconds(t: str) -> float:
+        h, m, s_ms = t.split(":")
+        s, ms = s_ms.split(",")
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+    for block in blocks:
+        lines = [x.strip() for x in block.splitlines() if x.strip()]
+        if len(lines) < 2:
+            continue
+
+        if re.fullmatch(r"\d+", lines[0]):
+            lines = lines[1:]
+
+        if not lines:
+            continue
+
+        if "-->" in lines[0]:
+            time_line = lines[0]
+            text_lines = lines[1:]
+            parts = [x.strip() for x in time_line.split("-->")]
+            if len(parts) == 2:
+                start = srt_time_to_seconds(parts[0])
+                end = srt_time_to_seconds(parts[1])
+                items.append(
+                    {
+                        "text": " ".join(text_lines).strip(),
+                        "start": start,
+                        "duration": max(0.1, end - start),
+                    }
+                )
+
+    return items
+
+
 def fetch_subtitles(video_id: str):
     try:
         api = YouTubeTranscriptApi()
@@ -110,40 +162,25 @@ def fetch_subtitles(video_id: str):
 
     except ParseError:
         raise RuntimeError(
-            "YouTube mengembalikan data subtitle yang kosong/invalid. "
-            "Kalau ini terjadi di Streamlit Cloud, biasanya IP cloud kena blokir YouTube."
+            "Request ke YouTube gagal diproses. Di Streamlit Cloud biasanya ini karena IP server diblok YouTube."
         )
-
     except Exception as e:
-        msg = str(e).strip()
+        msg = str(e).strip().lower()
 
-        if not msg:
-            msg = "Gagal mengambil subtitle."
-
-        lowered = msg.lower()
-
-        if "requestblocked" in lowered or "ipblocked" in lowered or "youtube is blocking requests" in lowered:
+        if "requestblocked" in msg or "ipblocked" in msg or "youtube is blocking requests" in msg:
             raise RuntimeError(
-                "Request diblokir oleh YouTube. "
-                "Kalau deploy di Streamlit Cloud, ini biasanya karena IP cloud diblok."
+                "Request diblokir oleh YouTube. Di Streamlit Cloud ini biasanya karena IP cloud diblok."
             )
-
-        if "notranscriptfound" in lowered or "no transcript found" in lowered:
+        if "no transcript found" in msg or "notranscriptfound" in msg:
             raise RuntimeError("Video ini tidak punya subtitle yang bisa diambil.")
-
-        if "transcriptsdisabled" in lowered or "subtitles are disabled" in lowered:
-            raise RuntimeError("Subtitle untuk video ini dimatikan.")
-
-        if "videounavailable" in lowered:
+        if "transcriptsdisabled" in msg or "subtitles are disabled" in msg:
+            raise RuntimeError("Subtitle video ini dimatikan.")
+        if "videounavailable" in msg:
             raise RuntimeError("Video tidak tersedia.")
+        if "too many requests" in msg:
+            raise RuntimeError("Terlalu banyak request. Coba lagi nanti.")
 
-        if "too many requests" in lowered:
-            raise RuntimeError("Terlalu banyak request. Coba lagi beberapa menit lagi.")
-
-        if "age" in lowered and "restrict" in lowered:
-            raise RuntimeError("Video age-restricted, subtitle tidak bisa diambil oleh library ini.")
-
-        raise RuntimeError(msg)
+        raise RuntimeError(str(e))
 
 
 def make_copy_button(text: str):
@@ -195,35 +232,85 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.form("subtitle_form", clear_on_submit=False):
-    url = st.text_input("Link YouTube", placeholder="https://www.youtube.com/watch?v=...")
-    submitted = st.form_submit_button("Ambil Subtitle")
+tab1, tab2, tab3 = st.tabs(["Dari Link YouTube", "Paste Manual", "Upload File"])
 
-if submitted:
-    st.session_state.error_msg = ""
-    st.session_state.subtitle_items = []
-    st.session_state.full_text = ""
-    st.session_state.video_id = ""
+with tab1:
+    with st.form("subtitle_form", clear_on_submit=False):
+        url = st.text_input(
+            "Link YouTube",
+            placeholder="https://www.youtube.com/watch?v=...",
+        )
+        submitted = st.form_submit_button("Ambil Subtitle")
 
-    try:
-        video_id = extract_video_id(url)
-        items = fetch_subtitles(video_id)
+    if submitted:
+        st.session_state.error_msg = ""
+        st.session_state.subtitle_items = []
+        st.session_state.full_text = ""
+        st.session_state.video_id = ""
 
-        full_text = "\n".join(
-            item.get("text", "").replace("\n", " ").strip()
-            for item in items
-            if item.get("text", "").strip()
-        ).strip()
+        try:
+            video_id = extract_video_id(url)
+            items = fetch_subtitles(video_id)
 
-        st.session_state.video_id = video_id
-        st.session_state.subtitle_items = items
+            full_text = "\n".join(
+                item.get("text", "").replace("\n", " ").strip()
+                for item in items
+                if item.get("text", "").strip()
+            ).strip()
+
+            st.session_state.video_id = video_id
+            st.session_state.subtitle_items = items
+            st.session_state.full_text = full_text
+
+        except Exception as e:
+            st.session_state.error_msg = str(e)
+
+with tab2:
+    manual_text = st.text_area(
+        "Paste subtitle di sini",
+        height=220,
+        placeholder="Tempel subtitle manual di sini...",
+    )
+    if st.button("Gunakan Subtitle Manual", use_container_width=True):
+        clean = manual_text.strip()
+        if clean:
+            st.session_state.error_msg = ""
+            st.session_state.video_id = "manual"
+            st.session_state.full_text = clean
+            st.session_state.subtitle_items = parse_plain_text_to_items(clean)
+        else:
+            st.session_state.error_msg = "Subtitle manual masih kosong."
+
+with tab3:
+    uploaded = st.file_uploader("Upload file .txt atau .srt", type=["txt", "srt"])
+    if uploaded is not None:
+        content = uploaded.read().decode("utf-8", errors="ignore")
+        if uploaded.name.lower().endswith(".srt"):
+            items = parse_srt(content)
+            if items:
+                full_text = "\n".join(
+                    item.get("text", "").strip()
+                    for item in items
+                    if item.get("text", "").strip()
+                ).strip()
+            else:
+                full_text = content.strip()
+                items = parse_plain_text_to_items(full_text)
+        else:
+            full_text = content.strip()
+            items = parse_plain_text_to_items(full_text)
+
+        st.session_state.error_msg = ""
+        st.session_state.video_id = uploaded.name.rsplit(".", 1)[0]
         st.session_state.full_text = full_text
-
-    except Exception as e:
-        st.session_state.error_msg = str(e)
+        st.session_state.subtitle_items = items
 
 if st.session_state.error_msg:
     st.error(st.session_state.error_msg)
+    if "diblok" in st.session_state.error_msg.lower():
+        st.info(
+            "Mode link YouTube gagal di server ini. Pakai tab Paste Manual atau Upload File supaya app tetap bisa dipakai."
+        )
 
 if st.session_state.full_text:
     st.subheader("Opsi")
@@ -241,7 +328,7 @@ if st.session_state.full_text:
     with col2:
         make_copy_button(st.session_state.full_text)
 
-    st.caption(f"{len(st.session_state.subtitle_items)} baris subtitle ditemukan.")
+    st.caption(f"{len(st.session_state.subtitle_items)} baris subtitle.")
     st.subheader("Subtitle")
 
     for item in st.session_state.subtitle_items:
@@ -262,7 +349,7 @@ else:
     st.markdown(
         """
         <div class="hint-box">
-            Tempel link YouTube di atas, lalu klik <b>Ambil Subtitle</b>.
+            Coba ambil dari link YouTube. Kalau diblok, pakai tab <b>Paste Manual</b> atau <b>Upload File</b>.
         </div>
         """,
         unsafe_allow_html=True,
