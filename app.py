@@ -2,17 +2,11 @@ import re
 import json
 import html
 from urllib.parse import urlparse, parse_qs
+from xml.etree.ElementTree import ParseError
 
 import streamlit as st
 import streamlit.components.v1 as components
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound,
-    CouldNotRetrieveTranscript,
-    VideoUnavailable,
-    TooManyRequests,
-)
+from youtube_transcript_api import YouTubeTranscriptApi
 
 st.set_page_config(page_title="YouTube Subtitle Grabber", page_icon="🎬", layout="wide")
 
@@ -105,41 +99,51 @@ def format_seconds(seconds: float) -> str:
 
 def fetch_subtitles(video_id: str):
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        api = YouTubeTranscriptApi()
+        fetched = api.fetch(video_id, languages=["id", "id-ID", "en", "en-US", "en-GB"])
+        items = fetched.to_raw_data()
 
-        preferred = ["id", "id-ID", "en", "en-US", "en-GB"]
+        if not items:
+            raise RuntimeError("Subtitle kosong atau tidak tersedia.")
 
-        transcript = None
+        return items
 
-        try:
-            transcript = transcript_list.find_transcript(preferred)
-        except Exception:
-            pass
+    except ParseError:
+        raise RuntimeError(
+            "YouTube mengembalikan data subtitle yang kosong/invalid. "
+            "Kalau ini terjadi di Streamlit Cloud, biasanya IP cloud kena blokir YouTube."
+        )
 
-        if transcript is None:
-            try:
-                transcript = transcript_list.find_generated_transcript(preferred)
-            except Exception:
-                pass
+    except Exception as e:
+        msg = str(e).strip()
 
-        if transcript is None:
-            for item in transcript_list:
-                transcript = item
-                break
+        if not msg:
+            msg = "Gagal mengambil subtitle."
 
-        if transcript is None:
-            raise NoTranscriptFound(video_id, preferred, transcript_list)
+        lowered = msg.lower()
 
-        return transcript.fetch()
+        if "requestblocked" in lowered or "ipblocked" in lowered or "youtube is blocking requests" in lowered:
+            raise RuntimeError(
+                "Request diblokir oleh YouTube. "
+                "Kalau deploy di Streamlit Cloud, ini biasanya karena IP cloud diblok."
+            )
 
-    except (
-        TranscriptsDisabled,
-        NoTranscriptFound,
-        CouldNotRetrieveTranscript,
-        VideoUnavailable,
-        TooManyRequests,
-    ) as e:
-        raise RuntimeError(str(e)) from e
+        if "notranscriptfound" in lowered or "no transcript found" in lowered:
+            raise RuntimeError("Video ini tidak punya subtitle yang bisa diambil.")
+
+        if "transcriptsdisabled" in lowered or "subtitles are disabled" in lowered:
+            raise RuntimeError("Subtitle untuk video ini dimatikan.")
+
+        if "videounavailable" in lowered:
+            raise RuntimeError("Video tidak tersedia.")
+
+        if "too many requests" in lowered:
+            raise RuntimeError("Terlalu banyak request. Coba lagi beberapa menit lagi.")
+
+        if "age" in lowered and "restrict" in lowered:
+            raise RuntimeError("Video age-restricted, subtitle tidak bisa diambil oleh library ini.")
+
+        raise RuntimeError(msg)
 
 
 def make_copy_button(text: str):
@@ -185,7 +189,6 @@ if "video_id" not in st.session_state:
 if "error_msg" not in st.session_state:
     st.session_state.error_msg = ""
 
-
 st.markdown('<div class="app-title">🎬 YouTube Subtitle Grabber</div>', unsafe_allow_html=True)
 st.markdown(
     '<div class="app-subtitle">Paste link YouTube, ambil subtitle, lalu copy atau download TXT.</div>',
@@ -193,10 +196,7 @@ st.markdown(
 )
 
 with st.form("subtitle_form", clear_on_submit=False):
-    url = st.text_input(
-        "Link YouTube",
-        placeholder="https://www.youtube.com/watch?v=...",
-    )
+    url = st.text_input("Link YouTube", placeholder="https://www.youtube.com/watch?v=...")
     submitted = st.form_submit_button("Ambil Subtitle")
 
 if submitted:
@@ -227,7 +227,7 @@ if st.session_state.error_msg:
 
 if st.session_state.full_text:
     st.subheader("Opsi")
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns(2)
 
     with col1:
         st.download_button(
@@ -242,8 +242,8 @@ if st.session_state.full_text:
         make_copy_button(st.session_state.full_text)
 
     st.caption(f"{len(st.session_state.subtitle_items)} baris subtitle ditemukan.")
-
     st.subheader("Subtitle")
+
     for item in st.session_state.subtitle_items:
         text = html.escape(item.get("text", "")).replace("\n", "<br>")
         start = format_seconds(item.get("start", 0))
